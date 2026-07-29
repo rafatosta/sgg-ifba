@@ -361,11 +361,47 @@ def relatorio_carga_horaria(request):
     if not (request.user.is_superuser or (hasattr(request.user, 'professor') and request.user.professor.is_diretor)):
         raise PermissionDenied("Acesso restrito à Direção do Campus.")
 
-    professores = Professor.objects.annotate(
-        total_aulas=Count('grades_horarias')
-    ).order_by('-total_aulas') 
+    professores_lista = Professor.objects.all().order_by('nome_completo')
+    dados_professores = []
 
-    return render(request, 'gestao/relatorio_carga.html', {'professores': professores})
+    for prof in professores_lista:
+        aulas = prof.grades_horarias.select_related('horario', 'disciplina', 'turma').all()
+        total_aulas = aulas.count()
+        total_horas = 0.0
+        
+        ppa_contabilizados = set()
+
+        for aula in aulas:
+            if aula.disciplina:
+                nome_disc = aula.disciplina.nome.upper()
+                # Captura variações: "PPA", "PRÁTICA PROFISSIONAL" ou "PRATICA PROFISSIONAL"
+                if "PPA" in nome_disc or "PRÁTICA PROFISSIONAL" in nome_disc or "PRATICA PROFISSIONAL" in nome_disc:
+                    chave_ppa = (aula.turma_id, aula.disciplina_id)
+                    if chave_ppa not in ppa_contabilizados:
+                        total_horas += 0.75
+                        ppa_contabilizados.add(chave_ppa)
+                    continue
+
+            # Regra normal por cada aula física individual
+            if aula.horario.turno == 'N':    # Noturno: 50 min = 0.833h
+                total_horas += 50 / 60
+            else:                            # Matutino e Vespertino: 45 min = 0.75h
+                total_horas += 45 / 60
+
+        porcentagem = int((total_horas / 15) * 100) if total_horas > 0 else 0
+        if porcentagem > 100:
+            porcentagem = 100
+
+        dados_professores.append({
+            'professor': prof,
+            'total_aulas': total_aulas,
+            'total_horas': round(total_horas, 2),
+            'porcentagem': porcentagem
+        })
+
+    dados_professores.sort(key=lambda x: x['total_horas'], reverse=True)
+
+    return render(request, 'gestao/relatorio_carga.html', {'dados_professores': dados_professores})
 
 @login_required
 def pagina_inicial(request):
@@ -478,6 +514,29 @@ def nova_solicitacao(request, aula_id, tipo):
         data_aplicacao = request.POST.get('data_aplicacao')
         carater = request.POST.get('carater', 'T') 
         
+        # ==========================================================
+        # NOVA TRAVA DE SEGURANÇA: Bloqueio de Duplicidade
+        # ==========================================================
+        solicitacao_duplicada = Solicitacao.objects.filter(
+            aula_origem=aula_origem,
+            data_aplicacao=data_aplicacao,
+            status__in=['P', 'A'] # Bloqueia se já houver uma Pendente ou Aprovada
+        ).first()
+
+        if solicitacao_duplicada:
+            # Renderiza um ecrã de aviso amigável sem quebrar o sistema
+            return HttpResponse(
+                f"<div style='font-family: sans-serif; padding: 40px; text-align: center; color: #333; max-width: 600px; margin: 0 auto;'>"
+                f"<h2 style='color: #e74c3c;'>⚠️ Solicitação Duplicada</h2>"
+                f"<p style='font-size: 1.1em;'>O sistema identificou que já existe um pedido de <strong>{solicitacao_duplicada.get_tipo_display()}</strong> "
+                f"({solicitacao_duplicada.get_status_display()}) registado para esta disciplina na data <strong>{data_aplicacao}</strong>.</p>"
+                f"<p style='color: #7f8c8d;'>Aceda a 'Minhas Permutas' para gerir ou cancelar a solicitação existente antes de tentar criar uma nova.</p>"
+                f"<button onclick='window.history.back()' style='padding: 10px 20px; background: #e74c3c; color: white; border: none; border-radius: 4px; cursor: pointer; margin-top: 20px; font-weight: bold; font-size: 1em;'>⬅️ Voltar e Corrigir</button>"
+                f"</div>", status=400
+            )
+        # ==========================================================
+        
+        # --- LÓGICA DE DEVOLUÇÃO (SISTEMA DE CRÉDITO) ---
         data_devolucao_post = request.POST.get('data_devolucao')
         a_combinar = request.POST.get('a_combinar') == 'on' 
         
@@ -654,3 +713,52 @@ def exportar_pdf_simulacao(request):
             return HttpResponse(f"Erro interno no motor de PDF: {str(e)}", status=500)
             
     return HttpResponse("Método não permitido.", status=405)
+
+@login_required
+def api_cancelar_solicitacao(request, id):
+    """
+    Exclui uma solicitação do banco de dados caso ainda esteja Pendente
+    e pertença ao professor que está logado.
+    """
+    if request.method == 'POST':
+        try:
+            prof = getattr(request.user, 'professor', None)
+            if not prof:
+                return JsonResponse({'sucesso': False, 'erro': 'Utilizador sem perfil de professor.'})
+            
+            # Busca a solicitação, garantindo que é do próprio professor
+            solicitacao = get_object_or_404(Solicitacao, id=id, solicitante=prof)
+            
+            if solicitacao.status != 'P':
+                return JsonResponse({'sucesso': False, 'erro': 'Apenas solicitações pendentes podem ser canceladas.'})
+            
+            # Apaga o registo do banco de dados
+            solicitacao.delete()
+            
+            return JsonResponse({'sucesso': True})
+        except Exception as e:
+            return JsonResponse({'sucesso': False, 'erro': str(e)})
+            
+    return JsonResponse({'sucesso': False, 'erro': 'Método não permitido.'}, status=405)
+
+@login_required
+def editar_solicitacao(request, id):
+    """
+    Rota temporária para a edição. 
+    Como a reconstrução do formulário complexo leva tempo, por enquanto 
+    orientamos o utilizador a cancelar e refazer.
+    """
+    prof = getattr(request.user, 'professor', None)
+    solicitacao = get_object_or_404(Solicitacao, id=id, solicitante=prof)
+    
+    if solicitacao.status != 'P':
+        return HttpResponse("Apenas solicitações pendentes podem ser editadas.", status=403)
+        
+    return HttpResponse(
+        "<div style='font-family: sans-serif; padding: 40px; text-align: center; color: #333;'>"
+        "<h2>🛠️ Edição em Desenvolvimento</h2>"
+        "<p>A interface de edição direta está a ser construída.</p>"
+        "<p>Por favor, volte atrás, <strong>cancele a solicitação incorreta</strong> e crie uma nova com os dados corretos.</p>"
+        "<button onclick='window.history.back()' style='padding: 10px 20px; background: #3498db; color: white; border: none; border-radius: 4px; cursor: pointer; margin-top: 20px;'>Voltar</button>"
+        "</div>"
+    )
